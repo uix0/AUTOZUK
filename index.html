@@ -878,7 +878,9 @@ function hlOnDeath(mob,player,region,mobs,tick,S){
   if(player.lastAttacker===mob)player.lastAttacker=null;
 }
 
+function hlRequiresFullClear(S){return (S.initialEnemyCount||0)<=2}
 function hlCleanupStopReason(S){
+  if(hlRequiresFullClear(S))return null;
   if((S.delayedBlobletSpawns||[]).length>0)return null;
   let active=S.mobs.filter(m=>!m.dead&&m.dying<=0);
   if(active.length===0)return null;
@@ -886,6 +888,8 @@ function hlCleanupStopReason(S){
   if((S.initialEnemyCount||0)>=4&&active.length===1)return 'last-enemy';
   return null;
 }
+function hlTrappedResultStatus(S,trappedBig){return !hlRequiresFullClear(S)&&checkTrappedValid(trappedBig)?'trapped':'invalid'}
+function hlTimeoutResultStatus(S){return hlRequiresFullClear(S)?'invalid':'timeout'}
 
 function hlRunSim(spawnCode,playerPos,pillarConfig,loadout,maxTicks,cachedRegion,seed){
   let S=hlInitState(spawnCode,playerPos,pillarConfig,loadout,cachedRegion,seed);if(!S)return null;
@@ -898,15 +902,14 @@ function hlRunSim(spawnCode,playerPos,pillarConfig,loadout,maxTicks,cachedRegion
     if(cleanupReason)return{attacks:S.attacks,completedTick:S.tick,mobs:S.mobs,status:'cleanup',cleanupReason,mobInitHP:S.mobInitHP};
     // Check trapped
     if(!S.player.aggro){
-      let allNoLOS=true,trappedBig=[];
-      for(let j=0;j<S.mobs.length;j++){let m=S.mobs[j];if(m.dead||m.dying>0)continue;if(m.noLOSTicks<20){allNoLOS=false;break}if(m.type!=='nibbler'&&!m.type.startsWith('bloblet'))trappedBig.push(m)}
-      if(allNoLOS&&deadCount<S.mobs.length){
-        let valid=checkTrappedValid(trappedBig);
-        return{attacks:S.attacks,completedTick:S.tick,mobs:S.mobs,status:valid?'trapped':'invalid',mobInitHP:S.mobInitHP};
+      let allNoLOS=true,trappedBig=[],activeCount=0;
+      for(let j=0;j<S.mobs.length;j++){let m=S.mobs[j];if(m.dead||m.dying>0||m.hp<=0)continue;activeCount++;if(m.noLOSTicks<20){allNoLOS=false;break}if(m.type!=='nibbler'&&!m.type.startsWith('bloblet'))trappedBig.push(m)}
+      if(allNoLOS&&activeCount>0&&deadCount<S.mobs.length){
+        return{attacks:S.attacks,completedTick:S.tick,mobs:S.mobs,status:hlTrappedResultStatus(S,trappedBig),mobInitHP:S.mobInitHP};
       }
     }
   }
-  return{attacks:S.attacks,completedTick:maxTicks,mobs:S.mobs,status:'timeout',mobInitHP:S.mobInitHP};
+  return{attacks:S.attacks,completedTick:maxTicks,mobs:S.mobs,status:hlTimeoutResultStatus(S),mobInitHP:S.mobInitHP};
 }
 
 function checkTrappedValid(trapped){
