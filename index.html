@@ -193,7 +193,7 @@ canvas#grid{border:1px solid var(--panel-border);cursor:crosshair;image-renderin
       <div class="control-group">
         <label>Spawn Code</label>
         <div style="display:flex;gap:4px">
-          <input type="text" id="spawnCode" placeholder="e.g. YooMXoRoB" maxlength="18" value="" style="flex:1">
+          <input type="text" id="spawnCode" placeholder="e.g. YooMXoRoB" maxlength="24" value="" style="flex:1">
           <button class="btn btn-secondary" onclick="pasteSpawnCode()" style="padding:6px 8px;font-size:9px;letter-spacing:0;flex-shrink:0" title="Paste from clipboard">PASTE</button>
           <button class="btn btn-secondary" onclick="randomSpawnCode()" style="padding:6px 8px;font-size:13px;letter-spacing:0;flex-shrink:0" title="Generate random spawn code">&#127922;</button>
         </div>
@@ -571,14 +571,27 @@ function osrsWalkStep(sx,sy,tx,ty,region){
 }
 
 const DEATH_ANIM_TICKS=3;
+const PILLAR_MAX_HP=255;
 
-function createRegion(pillarConfig){
+function pillarHpFromPercent(percent){
+  percent=Number(percent)||0;
+  if(percent<=0)return 0;
+  if(percent>=99)return PILLAR_MAX_HP;
+  return Math.max(1,Math.floor(PILLAR_MAX_HP*percent/100));
+}
+function effectivePillarConfig(parsed,fallback){
+  if(!parsed?.hasPillarHp)return{S:!!fallback.S,W:!!fallback.W,N:!!fallback.N};
+  return{S:parsed.pillarHp.S>0,W:parsed.pillarHp.W>0,N:parsed.pillarHp.N>0};
+}
+function pillarPercentConfig(parsed){return parsed?.hasPillarHp?parsed.pillarHp:null}
+
+function createRegion(pillarConfig,pillarPercents){
   let entities=[];
   for(let x=ARENA_X_MIN-1;x<=ARENA_X_MAX+1;x++){entities.push({x,y:ARENA_Y_MIN-1,size:1});entities.push({x,y:ARENA_Y_MAX+1,size:1})}
   for(let y=ARENA_Y_MIN;y<=ARENA_Y_MAX;y++){entities.push({x:ARENA_X_MIN-1,y,size:1});entities.push({x:ARENA_X_MAX+1,y,size:1})}
   let p2=[];
   for(let[key,loc]of[['S',PILLAR_LOCS.S],['W',PILLAR_LOCS.W],['N',PILLAR_LOCS.N]]){
-    if(pillarConfig[key]){let p={x:loc.x,y:loc.y,size:3,hp:255,maxHp:255,isPillar:true,dead:false,id:'pillar'+key};p2.push(p);entities.push(p)}
+    if(pillarConfig[key]){let percent=pillarPercents?.[key]??100,hp=pillarHpFromPercent(percent);let p={x:loc.x,y:loc.y,size:3,hp,maxHp:PILLAR_MAX_HP,hpPercent:percent,isPillar:true,dead:false,collapsing:false,collapseTick:undefined,id:'pillar'+key,key};p2.push(p);entities.push(p)}
   }
   // Precompute blocked tile grid for O(1) entity collision lookups (if you watched this AUTOZUK video, this is how we got that massive boost in speed and efficiency)
   let blocked=new Uint8Array(4096); // 64×64 grid, index = (x<<6)|y
@@ -587,18 +600,48 @@ function createRegion(pillarConfig){
   return{entities,pillars:p2,blocked};
 }
 
-function spawnNibblers(mobs,region,createFn,idFn){
+function removePillarCollision(region,pillar){
+  region.entities=region.entities.filter(entity=>entity!==pillar);
+  for(let x=pillar.x;x<pillar.x+pillar.size;x++)for(let y=pillar.y-pillar.size+1;y<=pillar.y;y++)region.blocked[(x<<6)|y]=0;
+  pillar.dead=true;pillar.collapsing=false;
+}
+function swTileAdjacentToPillar(entity,pillar){
+  let px=Math.max(pillar.x,Math.min(pillar.x+pillar.size-1,entity.x));
+  let py=Math.max(pillar.y-pillar.size+1,Math.min(pillar.y,entity.y));
+  return chebyshev(entity.x,entity.y,px,py)===1;
+}
+function swTileCardinalAdjacentToEntity(entity,target){
+  let closest=closestTileTo(target,entity.x,entity.y);
+  return Math.abs(entity.x-closest.x)+Math.abs(entity.y-closest.y)===1;
+}
+function beginPillarCollapse(pillar,tick,mobs,player){
+  if(pillar.dead||pillar.collapsing)return false;
+  pillar.hp=0;pillar.collapsing=true;pillar.collapseTick=tick;
+  pillar.collapseMobIds=mobs.filter(m=>!m.dead&&m.dying<=0&&(m.type==='nibbler'||swTileAdjacentToPillar(m,pillar))).map(m=>m.id);
+  return swTileAdjacentToPillar(player,pillar);
+}
+function activePillarTarget(mob,region){
+  if(mob.type!=='nibbler'||!mob.pillarTargetId)return null;
+  return region.pillars.find(p=>p.id===mob.pillarTargetId&&!p.dead&&!p.collapsing&&p.hp>0)||null;
+}
+function assignNibblersToRandomPillar(mobs,region,rng=Math.random){
+  let available=region.pillars.filter(p=>!p.dead&&!p.collapsing&&p.hp>0);
+  let target=available.length?available[Math.floor(rng()*available.length)]:null;
+  for(let mob of mobs)if(mob.type==='nibbler')mob.pillarTargetId=target?.id||null;
+  return target;
+}
+function spawnNibblers(mobs,region,createFn,idFn,rng=Math.random){
   // Spawn 3 nibblers in the 3x3 box: gameX 19-21, gameY 25-27
   // (local coords 9:17 to 11:19 where SW=1:1)
   let positions=[];
   for(let x=9;x<=11;x++)for(let y=12;y<=14;y++)positions.push({x,y});
   // Shuffle positions
-  for(let i=positions.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[positions[i],positions[j]]=[positions[j],positions[i]]}
+  for(let i=positions.length-1;i>0;i--){let j=Math.floor(rng()*(i+1));[positions[i],positions[j]]=[positions[j],positions[i]]}
   let spawned=0;
   for(let pos of positions){
     if(spawned>=3)break;
     if(!region.blocked[(pos.x<<6)|pos.y]&&!collidesWithMobs(pos.x,pos.y,1,mobs,null)){
-      let nib=createFn('nibbler',pos.x,pos.y,idFn());nib.aggroTarget='player';nib.stunned=0;mobs.push(nib);spawned++}
+      let nib=createFn('nibbler',pos.x,pos.y,idFn());nib.aggroTarget='player';nib.pillarTargetId=null;nib.stunned=0;mobs.push(nib);spawned++}
   }
 }
 
@@ -610,8 +653,14 @@ function parseSpawnCode(code){
     i++;
     // Check for optional infernoscouter index digit after mob char
     let infNum=0;
-    if(i<code.length&&code[i]>='1'&&code[i]<='9'){infNum=parseInt(code[i]);i++}
+    if(type!=='nothing'&&i<code.length&&code[i]>='1'&&code[i]<='9'){infNum=parseInt(code[i]);i++}
     spawns.push({type,x:SPAWN_LOCATIONS[pos].x,y:SPAWN_LOCATIONS[pos].y,infNum});pos++}
+  let baseCode=code.slice(0,i),suffix=code.slice(i),hasPillarHp=false,pillarHp=null,invalidPillarSuffix=false;
+  if(pos===9&&suffix.length===6&&/^\d{6}$/.test(suffix)){
+    let decode=pair=>pair==='99'?100:parseInt(pair,10);
+    pillarHp={N:decode(suffix.slice(0,2)),S:decode(suffix.slice(2,4)),W:decode(suffix.slice(4,6))};
+    hasPillarHp=true;
+  }else if(pos===9&&suffix.length>0){invalidPillarSuffix=true}
   // Assign implied infernoscouter number to mob(s) without one
   let nonNothing=spawns.filter(s=>s.type!=='nothing');
   let hasExplicit=nonNothing.some(s=>s.infNum>0);
@@ -621,7 +670,7 @@ function parseSpawnCode(code){
     remaining.sort((a,b)=>b-a); // assign highest remaining first
     let ri=0;for(let s of nonNothing)if(s.infNum===0&&ri<remaining.length)s.infNum=remaining[ri++];
   }
-  return{spawns,hasIndexInfo:hasExplicit};
+  return{spawns,hasIndexInfo:hasExplicit,hasPillarHp,pillarHp,baseCode,sanitizedCode:hasPillarHp?baseCode+suffix:baseCode,invalidPillarSuffix};
 }
 
 function findRespawnLocation(size,region,mobs){for(let x=16;x<23;x++)for(let y=11;y<24;y++)if(!collidesWithMobs(x,y,size,mobs,null)&&!collidesWithEntities(x,y,size,region.entities))return{x,y};return{x:11,y:9}}
@@ -657,21 +706,24 @@ function hlCreatePlayer(x,y,loadout){
 function hlInitState(spawnCode,playerPos,pillarConfig,loadout,cachedRegion,seed){
   let idCounter=0;
   let rng = (seed===undefined||seed===null) ? Math.random : mulberry32(seed);
-  let region=cachedRegion||createRegion(pillarConfig);
   let parsed=parseSpawnCode(spawnCode);if(parsed.error)return null;
+  let dynamicPillars=parsed.hasPillarHp;
+  let resolvedPillars=effectivePillarConfig(parsed,pillarConfig);
+  let region=dynamicPillars?createRegion(resolvedPillars,pillarPercentConfig(parsed)):(cachedRegion||createRegion(resolvedPillars));
   let initialEnemyCount=parsed.spawns.reduce((count,spawn)=>count+(spawn.type==='nothing'?0:1),0);
   let mobs=[],player=hlCreatePlayer(playerPos.x,playerPos.y,loadout),deadMobs=[];
   for(let spawn of parsed.spawns){if(spawn.type==='nothing')continue;let m=hlCreateMob(spawn.type,spawn.x,spawn.y,idCounter++);m.infNum=spawn.infNum||0;mobs.push(m)}
   // Sort by game index: higher infNum = lower game index = processed first
   if(parsed.hasIndexInfo)mobs.sort((a,b)=>b.infNum-a.infNum);
-  // Spawn 3 nibblers randomly if all pillars are dead
-  let allPillarsDead=!pillarConfig.S&&!pillarConfig.W&&!pillarConfig.N;
-  if(allPillarsDead){spawnNibblers(mobs,region,(t,x,y,id)=>hlCreateMob(t,x,y,id),()=>idCounter++)}
+  // Legacy codes retain the old all-pillars-dead rule. HP-aware codes always include nibblers.
+  let allPillarsDead=!resolvedPillars.S&&!resolvedPillars.W&&!resolvedPillars.N;
+  if(dynamicPillars||allPillarsDead){spawnNibblers(mobs,region,(t,x,y,id)=>hlCreateMob(t,x,y,id),()=>idCounter++,dynamicPillars?rng:Math.random)}
+  if(dynamicPillars)assignNibblersToRandomPillar(mobs,region,rng);
   // Store initial mob HP for post-hoc recoil tracking in calcSimDamage
   let mobInitHP={};
   let mobMap=new Map();
   for(let m of mobs){mobInitHP[m.id]={hp:m.hp,type:m.type};mobMap.set(m.id,m)}
-  return{region,mobs,player,tick:0,deadMobs,idCounter,loadout,attacks:[],mobTypes:new Set(mobs.map(m=>m.type)),mobInitHP,mobMap,delayedBlobletSpawns:[],initialEnemyCount,rng};
+  return{region,mobs,player,tick:0,deadMobs,idCounter,loadout,attacks:[],mobTypes:new Set(mobs.map(m=>m.type)),mobInitHP,mobMap,delayedBlobletSpawns:[],initialEnemyCount,dynamicPillars,rng};
 }
 function hlMarkMobForProjectileRemoval(mob,tick){
   if(mob.dead)return;
@@ -701,9 +753,30 @@ function hlProcessPendingMobDeaths(S,tick){
     }
   }
 }
+function hlDamagePillar(pillar,damage,tick,S){
+  if(pillar.dead||pillar.collapsing)return;
+  pillar.hp=Math.max(0,pillar.hp-damage);
+  if(pillar.hp>0)return;
+  let hitPlayer=beginPillarCollapse(pillar,tick,S.mobs,S.player);
+  if(hitPlayer)S.attacks.push({tick,isPillarCollapsePlayerDamage:true,pillarId:pillar.id});
+}
+function hlProcessPillarTransitions(S,tick){
+  if(!S.dynamicPillars)return;
+  for(let pillar of S.region.pillars){
+    if(!pillar.collapsing||pillar.collapseTick>=tick)continue;
+    for(let mobId of pillar.collapseMobIds||[]){
+      let mob=S.mobMap.get(mobId);
+      if(!mob||mob.dead||mob.dying>0||mob.hp<=0)continue;
+      let damage=mob.type==='nibbler'?mob.hp:Math.floor(mob.hp/2);
+      if(damage>0){mob.hp-=damage;S.attacks.push({tick,isPillarCollapseMobDamage:true,pillarId:pillar.id,mobId:mob.id,damage,killsNibbler:mob.type==='nibbler'});if(mob.hp<=0)hlMarkMobForProjectileRemoval(mob,tick-1)}
+    }
+    removePillarCollision(S.region,pillar);
+  }
+}
 
 function hlTick(S){
   S.tick++;let t=S.tick,region=S.region,mobs=S.mobs,player=S.player,loadout=S.loadout;
+  hlProcessPillarTransitions(S,t);
   hlProcessCorpseExpiry(S,t);
   hlProcessPendingMobDeaths(S,t);
   hlProcessDelayedBlobletSpawns(S,t);
@@ -787,11 +860,19 @@ function hlMoveMob(mob,player,region,mobs,S){
   if(mob.hasDig&&mob.digTimer>0){mob.digTimer--;if(mob.digTimer===0){mob.x=mob.digLocation.x;mob.y=mob.digLocation.y;mob.attackDelay=6;mob.frozen=2;mob.digLocation=null;if(player.aggro===mob)player.aggro=null}return}
   mob.hadLOS=mob.hasLOS;mob.hasLOS=mobHasLOS(region,mob,player);
   if(mob.hasLOS){mob.noLOSTicks=0}else{mob.noLOSTicks++}
-  if(mob.hasLOS||mob.frozen>0)return;
-  if(mob.hasDig&&!mob.hasLOS&&!mob.digTimer){if((mob.attackDelay<=-38&&S.rng()<0.1)||mob.attackDelay<=-50){startDig(mob,player,region);return}}
-  let dx=mob.x+Math.sign(player.x-mob.x),dy=mob.y+Math.sign(player.y-mob.y);
-  if(collisionMath(mob.x,mob.y,mob.size,player.x,player.y,1)){if(S.rng()<0.5){dy=mob.y;dx=mob.x+(S.rng()<0.5?1:-1)}else{dx=mob.x;dy=mob.y+(S.rng()<0.5?1:-1)}}
-  else if(collisionMath(dx,dy,mob.size,player.x,player.y,1)){dy=mob.y}
+  let pillarTarget=S.dynamicPillars?activePillarTarget(mob,region):null;
+  let dx,dy;
+  if(pillarTarget){
+    if(swTileCardinalAdjacentToEntity(mob,pillarTarget)||mob.frozen>0)return;
+    let dest=getClosestFaceTile(pillarTarget,mob.x,mob.y,region);if(!dest)return;
+    dx=mob.x+Math.sign(dest.x-mob.x);dy=mob.y+Math.sign(dest.y-mob.y);
+  }else{
+    if(mob.hasLOS||mob.frozen>0)return;
+    if(mob.hasDig&&!mob.hasLOS&&!mob.digTimer){if((mob.attackDelay<=-38&&S.rng()<0.1)||mob.attackDelay<=-50){startDig(mob,player,region);return}}
+    dx=mob.x+Math.sign(player.x-mob.x);dy=mob.y+Math.sign(player.y-mob.y);
+    if(collisionMath(mob.x,mob.y,mob.size,player.x,player.y,1)){if(S.rng()<0.5){dy=mob.y;dx=mob.x+(S.rng()<0.5?1:-1)}else{dx=mob.x;dy=mob.y+(S.rng()<0.5?1:-1)}}
+    else if(collisionMath(dx,dy,mob.size,player.x,player.y,1)){dy=mob.y}
+  }
   if(mob.attackDelay>mob.atkSpeed)return;
   let xOff=dx-mob.x,yOff=mob.y-dy;
   // Match live-game NPC movement: for diagonals, only the destination footprint must be open.
@@ -813,6 +894,11 @@ function hlCanMove(mob,xOff,yOff,region,mobs){
 }
 function hlMobAttack(mob,player,region,mobs,tick,S){
   if(mob.dead||mob.dying>0||mob.stunned>0)return;
+  let pillarTarget=S.dynamicPillars?activePillarTarget(mob,region):null;
+  if(pillarTarget){
+    if(!swTileCardinalAdjacentToEntity(mob,pillarTarget)||mob.attackDelay>0)return;
+    hlDamagePillar(pillarTarget,Math.floor(S.rng()*5),tick,S);mob.attackDelay=mob.atkSpeed;return;
+  }
   mob.hadLOS=mob.hasLOS;mob.hasLOS=mobHasLOS(region,mob,player);
   if(mob.hasFlicker){mob.flickering=(mob.attackDelay===1&&mob.hasLOS);if(!mob.hasLOS||mob.attackDelay>0||isUnderMob(mob,player))return;
     if(S.rng()<0.1&&S.deadMobs.length>0){let toRes=S.deadMobs.shift();toRes.revivedOnce=true;let reviveHp=Math.floor(toRes.maxHp/2);toRes.hp=reviveHp;toRes.dead=false;toRes.dying=-1;toRes.pendingRemovalTick=undefined;toRes.corpseRemovalTick=undefined;toRes.attackDelay=toRes.atkSpeed+1;toRes.stunned=0;toRes.frozen=0;
@@ -890,6 +976,7 @@ function hlCleanupStopReason(S){
 }
 function hlTrappedResultStatus(S,trappedBig){return !hlRequiresFullClear(S)&&checkTrappedValid(trappedBig)?'trapped':'invalid'}
 function hlTimeoutResultStatus(S){return hlRequiresFullClear(S)?'invalid':'timeout'}
+function hlHasActivePillarThreat(S){return !!S.dynamicPillars&&S.mobs.some(m=>!m.dead&&m.dying<=0&&!!activePillarTarget(m,S.region))}
 
 function hlRunSim(spawnCode,playerPos,pillarConfig,loadout,maxTicks,cachedRegion,seed){
   let S=hlInitState(spawnCode,playerPos,pillarConfig,loadout,cachedRegion,seed);if(!S)return null;
@@ -901,7 +988,7 @@ function hlRunSim(spawnCode,playerPos,pillarConfig,loadout,maxTicks,cachedRegion
     let cleanupReason=hlCleanupStopReason(S);
     if(cleanupReason)return{attacks:S.attacks,completedTick:S.tick,mobs:S.mobs,status:'cleanup',cleanupReason,mobInitHP:S.mobInitHP};
     // Check trapped
-    if(!S.player.aggro){
+    if(!S.player.aggro&&!hlHasActivePillarThreat(S)){
       let allNoLOS=true,trappedBig=[],activeCount=0;
       for(let j=0;j<S.mobs.length;j++){let m=S.mobs[j];if(m.dead||m.dying>0||m.hp<=0)continue;activeCount++;if(m.noLOSTicks<20){allNoLOS=false;break}if(m.type!=='nibbler'&&!m.type.startsWith('bloblet'))trappedBig.push(m)}
       if(allNoLOS&&activeCount>0&&deadCount<S.mobs.length){
@@ -1083,6 +1170,18 @@ function calcSimDamage(attacks,prayerSeq,loadout,mobInitHP){
       }
       applyPendingDeaths(atk.tick);
     }
+    if(atk.isPillarCollapsePlayerDamage){
+      let damage=Math.floor(Math.max(0,hp)/2);
+      hp-=damage;if(hp<minHp)minHp=hp;
+      continue;
+    }
+    if(atk.isPillarCollapseMobDamage){
+      if(hasRecoil&&!deadMobs.has(atk.mobId)&&mobHP[atk.mobId]!==undefined){
+        mobHP[atk.mobId]-=atk.damage;
+        if(mobHP[atk.mobId]<=0){if(atk.killsNibbler)deadMobs.add(atk.mobId);else scheduleMobRemoval(atk.mobId,atk.tick)}
+      }
+      continue;
+    }
     // Player attack: blood barrage heals 25% of damage dealt at cast time, but
     // mob HP/death is delayed until the projectile's hitTick.
     if(atk.isPlayerAttack){
@@ -1236,6 +1335,7 @@ self.onmessage = function(e){
   }
   if(msg.type === 'exclude'){
     let parsed = parseSpawnCode(msg.spawnCode);
+    let exclusionRegion=parsed.hasPillarHp?createRegion(effectivePillarConfig(parsed,W.pillarConfig),pillarPercentConfig(parsed)):W.region;
     let testMobs = [];
     if(!parsed.error){
       for(let spawn of parsed.spawns){
@@ -1245,7 +1345,7 @@ self.onmessage = function(e){
     }
     let excluded = [], eligible = [];
     for(let t of msg.tiles){
-      if(checkTileExcluded(t.x,t.y,testMobs,W.region)) excluded.push(t);
+      if(checkTileExcluded(t.x,t.y,testMobs,exclusionRegion)) excluded.push(t);
       else eligible.push(t);
     }
     self.postMessage({type:'exclude-result', excluded, eligible});
@@ -1708,7 +1808,7 @@ function initializeEquipmentSelector(){
 }
 
 // ===== PHASE 1: STATE =====
-let sim=null,pillars={S:true,W:true,N:true},playerPlacement=null;
+let sim=null,pillars={S:true,W:true,N:true},pillarHpToggleMemory={S:100,W:100,N:100},playerPlacement=null;
 let playing=false,playInterval=null;
 let tickEvents=[],mobIdCounter=0;
 let tickHits={},gridMobColumns=[];
@@ -1872,18 +1972,20 @@ function createPlayer(x,y){let startHp=loadoutStartingHp(currentLoadout),maxHp=M
 
 function initSim(spawnCode,playerPos,startTick=15){
   mobIdCounter=0;tickEvents=[];tickHits={};gridMobColumns=[];
-  let region=createRegion(pillars),mobs=[],player=createPlayer(playerPos.x,playerPos.y),deadMobs=[];
   let parsed=parseSpawnCode(spawnCode);
   if(parsed.error){setStatus(parsed.error,'error');return null}
+  let dynamicPillars=parsed.hasPillarHp,resolvedPillars=effectivePillarConfig(parsed,pillars);
+  let region=createRegion(resolvedPillars,pillarPercentConfig(parsed)),mobs=[],player=createPlayer(playerPos.x,playerPos.y),deadMobs=[];
   for(let spawn of parsed.spawns){if(spawn.type==='nothing')continue;let mob=createMob(spawn.type,spawn.x,spawn.y,mobIdCounter++);mob.aggroTarget='player';mob.infNum=spawn.infNum||0;mobs.push(mob)}
   // Sort by game index: higher infNum = lower game index = processed first
   if(parsed.hasIndexInfo)mobs.sort((a,b)=>b.infNum-a.infNum);
-  // Spawn 3 nibblers randomly if all pillars are dead
-  let allPillarsDead=!pillars.S&&!pillars.W&&!pillars.N;
-  if(allPillarsDead){spawnNibblers(mobs,region,(t,x,y,id)=>createMob(t,x,y,id),()=>mobIdCounter++)}
+  // Legacy codes retain the old all-pillars-dead rule. HP-aware codes always include nibblers.
+  let allPillarsDead=!resolvedPillars.S&&!resolvedPillars.W&&!resolvedPillars.N;
+  if(dynamicPillars||allPillarsDead)spawnNibblers(mobs,region,(t,x,y,id)=>createMob(t,x,y,id),()=>mobIdCounter++);
+  if(dynamicPillars)assignNibblersToRandomPillar(mobs,region,Math.random);
   for(let m of mobs)gridMobColumns.push({id:m.id,letter:m.letter,color:m.color,type:m.type});
   sortMobColumns();
-  return{region,mobs,player,tick:startTick,startTick,deadMobs,delayedBlobletSpawns:[]};
+  return{region,mobs,player,tick:startTick,startTick,deadMobs,delayedBlobletSpawns:[],dynamicPillars};
 }
 
 function markMobForProjectileRemoval(mob,tick){
@@ -1914,10 +2016,33 @@ function processPendingMobDeaths(simRef,tick){
     }
   }
 }
+function damagePillar(pillar,damage,tick,simRef){
+  if(pillar.dead||pillar.collapsing)return;
+  pillar.hp=Math.max(0,pillar.hp-damage);
+  tickEvents.push({tick,type:'nibbler',detail:`Nibblers hit ${pillar.key} pillar for ${damage} (${pillar.hp}/${pillar.maxHp})`,mobId:-1,isHit:true});
+  if(pillar.hp>0)return;
+  let hitPlayer=beginPillarCollapse(pillar,tick,simRef.mobs,simRef.player);
+  if(hitPlayer){let collapseDamage=Math.floor(Math.max(0,simRef.player.hp)/2);simRef.player.hp-=collapseDamage;tickEvents.push({tick,type:'nibbler',detail:`${pillar.key} pillar collapsed: player takes ${collapseDamage}`,mobId:-1,isHit:true})}
+  else tickEvents.push({tick,type:'nibbler',detail:`${pillar.key} pillar collapsed`,mobId:-1,isHit:true});
+}
+function processPillarTransitions(simRef,tick){
+  if(!simRef.dynamicPillars)return;
+  for(let pillar of simRef.region.pillars){
+    if(!pillar.collapsing||pillar.collapseTick>=tick)continue;
+    for(let mobId of pillar.collapseMobIds||[]){
+      let mob=simRef.mobs.find(m=>m.id===mobId);
+      if(!mob||mob.dead||mob.dying>0||mob.hp<=0)continue;
+      let killsNibbler=mob.type==='nibbler',damage=killsNibbler?mob.hp:Math.floor(mob.hp/2);
+      if(damage>0){mob.hp-=damage;if(mob.hp<=0)markMobForProjectileRemoval(mob,tick-1);tickEvents.push({tick,type:mob.type,detail:killsNibbler?`${pillar.key} pillar collapse kills nibbler #${mob.id}`:`${pillar.key} pillar collapse hits ${mob.type} #${mob.id} for ${damage}`,mobId:mob.id,isHit:true})}
+    }
+    removePillarCollision(simRef.region,pillar);
+  }
+}
 
 function simulateTick(){
   if(!sim)return;sim.tick++;
   let t=sim.tick,region=sim.region,mobs=sim.mobs,player=sim.player;
+  processPillarTransitions(sim,t);
   processCorpseExpiry(sim,t);
   processPendingMobDeaths(sim,t);
   processDelayedBlobletSpawns(sim,t);
@@ -2010,11 +2135,19 @@ function moveMob(mob,player,region,mobs,simRef){
   if(mob.hasDig&&mob.digTimer>0){mob.digTimer--;if(mob.digTimer===0){mob.x=mob.digLocation.x;mob.y=mob.digLocation.y;mob.attackDelay=6;mob.frozen=2;mob.digLocation=null;if(player.aggro===mob)player.aggro=null}return}
   mob.hadLOS=mob.hasLOS;mob.hasLOS=mobHasLOS(region,mob,player);
   if(mob.hasLOS){mob.noLOSTicks=0}else{mob.noLOSTicks=(mob.noLOSTicks||0)+1}
-  if(mob.hasLOS||mob.frozen>0)return;
-  if(mob.hasDig&&!mob.hasLOS&&!mob.digTimer){if((mob.attackDelay<=-38&&Math.random()<0.1)||mob.attackDelay<=-50){startDig(mob,player,region);return}}
-  let dx=mob.x+Math.sign(player.x-mob.x),dy=mob.y+Math.sign(player.y-mob.y);
-  if(collisionMath(mob.x,mob.y,mob.size,player.x,player.y,1)){if(Math.random()<0.5){dy=mob.y;dx=mob.x+(Math.random()<0.5?1:-1)}else{dx=mob.x;dy=mob.y+(Math.random()<0.5?1:-1)}}
-  else if(collisionMath(dx,dy,mob.size,player.x,player.y,1)){dy=mob.y}
+  let pillarTarget=simRef.dynamicPillars?activePillarTarget(mob,region):null;
+  let dx,dy;
+  if(pillarTarget){
+    if(swTileCardinalAdjacentToEntity(mob,pillarTarget)||mob.frozen>0)return;
+    let dest=getClosestFaceTile(pillarTarget,mob.x,mob.y,region);if(!dest)return;
+    dx=mob.x+Math.sign(dest.x-mob.x);dy=mob.y+Math.sign(dest.y-mob.y);
+  }else{
+    if(mob.hasLOS||mob.frozen>0)return;
+    if(mob.hasDig&&!mob.hasLOS&&!mob.digTimer){if((mob.attackDelay<=-38&&Math.random()<0.1)||mob.attackDelay<=-50){startDig(mob,player,region);return}}
+    dx=mob.x+Math.sign(player.x-mob.x);dy=mob.y+Math.sign(player.y-mob.y);
+    if(collisionMath(mob.x,mob.y,mob.size,player.x,player.y,1)){if(Math.random()<0.5){dy=mob.y;dx=mob.x+(Math.random()<0.5?1:-1)}else{dx=mob.x;dy=mob.y+(Math.random()<0.5?1:-1)}}
+    else if(collisionMath(dx,dy,mob.size,player.x,player.y,1)){dy=mob.y}
+  }
   if(mob.attackDelay>mob.atkSpeed)return;
   let xOff=dx-mob.x,yOff=mob.y-dy;
   // Diagonal: OSRS-style NPC movement only checks whether the destination footprint is clear.
@@ -2039,6 +2172,11 @@ function canMoveTiles(mob,xOff,yOff,axis_unused,region,mobs){
 }
 function mobAttackStep(mob,player,region,mobs,tick,simRef){
   if(mob.dead||mob.dying>0||mob.stunned>0)return;
+  let pillarTarget=simRef.dynamicPillars?activePillarTarget(mob,region):null;
+  if(pillarTarget){
+    if(!swTileCardinalAdjacentToEntity(mob,pillarTarget)||mob.attackDelay>0)return;
+    damagePillar(pillarTarget,Math.floor(Math.random()*5),tick,simRef);mob.attackDelay=mob.atkSpeed;return;
+  }
   mob.hadLOS=mob.hasLOS;mob.hasLOS=mobHasLOS(region,mob,player);
   if(mob.hasFlicker){mob.flickering=(mob.attackDelay===1&&mob.hasLOS);if(!mob.hasLOS||mob.attackDelay>0||isUnderMob(mob,player))return;
     if(Math.random()<0.1&&simRef.deadMobs.length>0){let toRes=simRef.deadMobs.shift();toRes.revivedOnce=true;toRes.hp=Math.floor(toRes.maxHp/2);toRes.dead=false;toRes.dying=-1;toRes.pendingRemovalTick=undefined;toRes.corpseRemovalTick=undefined;toRes.attackDelay=toRes.atkSpeed+1;toRes.stunned=0;toRes.frozen=0;
@@ -2330,13 +2468,18 @@ function render(){
     if(previewMobs.length===0&&!practiceState.open){ctx.globalAlpha=0.15;for(let i=0;i<SPAWN_LOCATIONS.length;i++){let sp=SPAWN_LOCATIONS[i],sx=(sp.x-ARENA_X_MIN)*TILE_SIZE,sy=(sp.y-ARENA_Y_MIN)*TILE_SIZE;ctx.fillStyle='#ffffff';ctx.fillRect(sx,sy,TILE_SIZE,TILE_SIZE);ctx.globalAlpha=0.3;ctx.font=`${Math.max(8,TILE_SIZE-4)}px JetBrains Mono`;ctx.textAlign='center';ctx.textBaseline='middle';drawFlipText(String(i+1),sx+TILE_SIZE/2,sy+TILE_SIZE/2);ctx.globalAlpha=0.15}ctx.globalAlpha=1}
   }
 
-  // Draw pillars
-  for(let key of['S','W','N']){if(!pillars[key])continue;let p=PILLAR_LOCS[key],isAlive=true;
-    if(sim){let rp=sim.region.pillars.find(pp=>pp.id==='pillar'+key);if(rp&&rp.dead)isAlive=false}
+  // Draw pillars. HP-aware codes override the legacy toggle state.
+  let parsedPillars=parseSpawnCode(document.getElementById('spawnCode')?.value||'');
+  let solverPillarFrame=!sim&&solverPreviewState?.frame;
+  for(let key of['S','W','N']){let p=PILLAR_LOCS[key],isAlive=false,isCollapsing=false,hpPercent=100;
+    if(sim&&sim.dynamicPillars){let rp=sim.region.pillars.find(pp=>pp.id==='pillar'+key);isAlive=!!rp&&!rp.dead;isCollapsing=!!rp?.collapsing&&rp.collapseTick===sim.tick;if(rp)hpPercent=rp.hp<=0?0:Math.max(1,Math.round(rp.hp/rp.maxHp*100))}
+    else if(solverPillarFrame?.dynamicPillars){let rp=solverPillarFrame.pillars.find(pp=>pp.id==='pillar'+key);isAlive=!!rp&&!rp.dead;isCollapsing=!!rp?.collapsing&&rp.collapseTick===solverPillarFrame.tick;if(rp)hpPercent=rp.hp<=0?0:Math.max(1,Math.round(rp.hp/rp.maxHp*100))}
+    else if(parsedPillars.hasPillarHp){hpPercent=parsedPillars.pillarHp[key];isAlive=hpPercent>0}
+    else isAlive=!!pillars[key];
     if(!isAlive)continue;
-    ctx.fillStyle='#000000';ctx.fillRect((p.x-ARENA_X_MIN)*TILE_SIZE+1,(p.y-(p.size-1)-ARENA_Y_MIN)*TILE_SIZE+1,p.size*TILE_SIZE-2,p.size*TILE_SIZE-2);
+    ctx.fillStyle=isCollapsing?'#ef2d2d':'#000000';ctx.fillRect((p.x-ARENA_X_MIN)*TILE_SIZE+1,(p.y-(p.size-1)-ARENA_Y_MIN)*TILE_SIZE+1,p.size*TILE_SIZE-2,p.size*TILE_SIZE-2);
     ctx.fillStyle='#ffffff';ctx.font=`bold ${Math.max(9,TILE_SIZE-4)}px JetBrains Mono`;ctx.textAlign='center';ctx.textBaseline='middle';
-    drawFlipText(key,(p.x+1-ARENA_X_MIN)*TILE_SIZE+TILE_SIZE/2,(p.y-1-ARENA_Y_MIN)*TILE_SIZE+TILE_SIZE/2)}
+    drawFlipText(hpPercent>=100?key:String(hpPercent),(p.x+1-ARENA_X_MIN)*TILE_SIZE+TILE_SIZE/2,(p.y-1-ARENA_Y_MIN)*TILE_SIZE+TILE_SIZE/2)}
 
   if(sim){for(let mob of sim.mobs){if(!mob.dead)drawMob(mob)}
     let p=sim.player,px=(p.x-ARENA_X_MIN)*TILE_SIZE,py=(p.y-ARENA_Y_MIN)*TILE_SIZE;
@@ -2437,7 +2580,7 @@ function buildSolverPreviewFrames(spawnCode,tile,loadout,maxTicks,seedBase,simIn
   let frames=[],sampleTicks=[0,2,4,7,10,14,19,25],limit=Math.min(maxTicks||25,25);
   for(let target of sampleTicks){
     if(target>limit)break;
-    while(S.tick<target)hlTick(S);
+    while(S.tick<target){hlTick(S);if(S.dynamicPillars&&S.region.pillars.some(p=>p.collapsing&&p.collapseTick===S.tick))frames.push(captureSolverPreviewFrame(S,tile))}
     frames.push(captureSolverPreviewFrame(S,tile));
     if(S.mobs.every(m=>m.dead))break;
   }
@@ -2447,6 +2590,8 @@ function captureSolverPreviewFrame(S,tile){
   return{
     tile:{x:tile.x,y:tile.y},
     tick:S.tick,
+    dynamicPillars:S.dynamicPillars,
+    pillars:S.region.pillars.map(p=>({id:p.id,dead:p.dead,collapsing:p.collapsing,collapseTick:p.collapseTick,hp:p.hp,maxHp:p.maxHp})),
     player:{x:S.player.x,y:S.player.y,aggroId:S.player.aggro?S.player.aggro.id:null},
     mobs:S.mobs.filter(m=>!m.dead).map(m=>({
       id:m.id,type:m.type,x:m.x,y:m.y,size:m.size,hp:m.hp,maxHp:m.maxHp,
@@ -2607,15 +2752,47 @@ canvas.addEventListener('click',function(e){
   setStatus(`Player placed at (${gx}, ${gy})`,'info');render();
 });
 
-function togglePillar(key){pillars[key]=!pillars[key];document.getElementById('pillar'+key).classList.toggle('active');updatePreview();render()}
+function encodePillarHpSuffix(pillarHp){
+  return['N','S','W'].map(key=>pillarHp[key]>=100?'99':String(Math.max(0,Math.round(pillarHp[key]))).padStart(2,'0')).join('');
+}
+function togglePillar(key){
+  let input=document.getElementById('spawnCode'),parsed=parseSpawnCode(input.value);
+  if(parsed.hasPillarHp){
+    let next={...parsed.pillarHp};
+    if(next[key]>0){pillarHpToggleMemory[key]=next[key];next[key]=0}
+    else next[key]=pillarHpToggleMemory[key]||100;
+    input.value=parsed.baseCode+encodePillarHpSuffix(next);
+    input.dispatchEvent(new Event('input'));
+    return;
+  }
+  pillars[key]=!pillars[key];
+  updatePreview();
+}
+function syncPillarButtons(parsed){
+  let names={S:'South',W:'West',N:'North'};
+  for(let key of['S','W','N']){
+    let button=document.getElementById('pillar'+key);if(!button)continue;
+    let active=parsed?.hasPillarHp?parsed.pillarHp[key]>0:pillars[key];
+    if(parsed?.hasPillarHp&&parsed.pillarHp[key]>0)pillarHpToggleMemory[key]=parsed.pillarHp[key];
+    button.classList.toggle('active',active);
+    button.textContent=names[key];
+  }
+}
 function updatePreview(){
   let code=document.getElementById('spawnCode').value;previewMobs=[];
-  if(!code.trim()){render();return}let parsed=parseSpawnCode(code);if(parsed.error){render();return}
+  if(!code.trim()){syncPillarButtons(null);render();return}let parsed=parseSpawnCode(code);syncPillarButtons(parsed);if(parsed.error){render();return}
   for(let spawn of parsed.spawns){if(spawn.type==='nothing')continue;let d=MOB_DEFS[spawn.type];previewMobs.push({x:spawn.x,y:spawn.y,size:d.size,color:d.color,letter:d.letter,type:spawn.type})}render();
+}
+function cleanSpawnCodeForRun(){
+  let input=document.getElementById('spawnCode'),parsed=parseSpawnCode(input.value);
+  if(!parsed.error&&parsed.invalidPillarSuffix){input.value=parsed.sanitizedCode;parsed=parseSpawnCode(input.value);updatePreview()}
+  return parsed;
 }
 function ensureSim(){
   if(sim)return true;let code=document.getElementById('spawnCode').value;
   if(!code.trim()){showSpawnCodeError();setStatus('Enter a spawn code first','error');return false}
+  let parsed=cleanSpawnCodeForRun();if(parsed.error){setStatus(parsed.error,'error');return false}
+  code=document.getElementById('spawnCode').value;
   if(!playerPlacement){setStatus('Click the grid to place the player first','error');return false}
   sim=initSim(code,playerPlacement);if(!sim)return false;
   rebuildTickGridHeader();document.getElementById('tickGridBody').innerHTML='';tickGridUserScrolled=false;eventListUserScrolled=false;
@@ -2630,13 +2807,18 @@ function changeLoadout(key){
 function pasteSpawnCode(){
   navigator.clipboard.readText().then(text=>{
     text=text.trim();
-    // Strip digits to count mob chars, validate 9 positions with optional index digits
-    let stripped=text.replace(/[1-9]/g,'');
-    if(stripped.length===9&&/^[MRXBYOmrxbyo]{9}$/i.test(stripped)&&text.length<=18&&/^[MRXBYOmrxbyo1-9]+$/i.test(text)){
+    let parsed=parseSpawnCode(text);
+    if(!parsed.error){
       document.getElementById('spawnCode').value=text.toUpperCase();
       document.getElementById('spawnCode').dispatchEvent(new Event('input'));
     }
   }).catch(()=>{});
+}
+function randomPillarHpPercent(){
+  let roll=Math.random();
+  if(roll<0.5)return 100;
+  if(roll<0.75)return 0;
+  return Math.floor(Math.random()*101);
 }
 function randomSpawnCode(){
   let monsters=['M','R'];
@@ -2651,6 +2833,7 @@ function randomSpawnCode(){
   for(let i=order.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}
   let monsterIndex=0;
   let code=codeSlots.map(ch=>ch==='O'?'O':ch+order[monsterIndex++]).join('');
+  code+=encodePillarHpSuffix({N:randomPillarHpPercent(),S:randomPillarHpPercent(),W:randomPillarHpPercent()});
   let input=document.getElementById('spawnCode');
   input.value=code;
   input.dispatchEvent(new Event('input'));
@@ -2791,7 +2974,8 @@ async function startAutozuk(){
   stopSolverVisualPreview();
   let code=document.getElementById('spawnCode').value;
   if(!code.trim()){showSpawnCodeError();setStatus('Enter a spawn code first','error');return}
-  let parsed=parseSpawnCode(code);if(parsed.error){setStatus(parsed.error,'error');return}
+  let parsed=cleanSpawnCodeForRun();if(parsed.error){setStatus(parsed.error,'error');return}
+  code=document.getElementById('spawnCode').value;
 
   // Stop any Phase 1 sim and reset tick state
   stopPlay();sim=null;tickEvents=[];tickHits={};gridMobColumns=[];
@@ -2820,7 +3004,7 @@ async function startAutozuk(){
   if(loadout.isBloodBarrage)maxTicks+=50;
   // Reduce tick cap for waves without a mager
   let hasMager=parsed.spawns.some(s=>s.type==='mager');
-  if(!hasMager&&maxTicks>150)maxTicks=150;
+  if(!hasMager&&!parsed.hasPillarHp&&maxTicks>150)maxTicks=150;
 
   // Build preview mobs for exclusion check
   updatePreview();
